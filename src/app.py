@@ -13,6 +13,9 @@ from openai import OpenAI
 import chromadb
 import dice_ml
 
+# Reuse the exact panel feature logic from training (single source of truth)
+import train_model as tm
+
 
 def safe_divide(numerator, denominator):
     """Safe division: returns 0 where denominator is 0 or NaN."""
@@ -43,23 +46,28 @@ def compute_ratios(df):
     return df
 
 
-# Key indicators for YoY trend (must match train_model.py)
-YOY_RAW = ["X4", "X6", "X10", "X16", "X17"]  # EBITDA, Net Income, Total Assets, Total Revenue, Total Liabilities
+def build_inference_features(years_df):
+    """Build the full FEATURES vector from a company's multi-year history.
 
+    `years_df`: one row per fiscal year (oldest first, newest last), columns X1-X18.
+    Mirrors train_model.load_and_prepare_data: per-year ratios -> panel summary of
+    the full window -> level features from the most recent year. Returns a single-row
+    DataFrame aligned to tm.FEATURES (unscaled; caller applies the scaler).
+    """
+    df = years_df.copy().reset_index(drop=True)
 
-def compute_yoy(df, prev_df):
-    """Compute YoY change rate features for key indicators."""
-    df = df.copy()
-    for feat in YOY_RAW:
-        curr = df[feat].values
-        prev = prev_df[feat].values
-        df[f"YoY_{feat}"] = safe_divide(curr - prev, np.abs(prev))
+    # Per-year financial ratios (needed for panel stats on ratios)
+    df = compute_ratios(df)
 
-    yoy_cols = [c for c in df.columns if c.startswith("YoY_")]
-    for col in yoy_cols:
-        df[col] = df[col].clip(-10, 10)
+    # Panel (multi-year) summary features from the full window
+    panel = tm.compute_panel_features(df)
 
-    return df
+    # Level features = most recent year's raw + ratio values
+    last = df.iloc[[-1]].copy().reset_index(drop=True)
+    for k, v in panel.items():
+        last[k] = v
+
+    return last.reindex(columns=tm.FEATURES, fill_value=0.0)
 
 
 # --- Paths ---
@@ -620,53 +628,34 @@ selected_industry = st.sidebar.selectbox(t["industry_label"], INDUSTRIES, index=
 st.sidebar.markdown("---")
 st.sidebar.markdown(t["sidebar_desc"])
 
-# Current year inputs (X1-X18 only — ratios and YoY are computed automatically)
-input_data = {}
-for feat in RAW_FEATURES:
-    label = feature_labels.get(feat, feat)
-    input_data[feat] = st.sidebar.number_input(
-        f"{label} ({feat})",
-        value=0.0,
-        format="%.2f",
-        key=feat,
-    )
+# Multi-year financials input — one row per fiscal year (oldest first, newest last).
+# Panel features (trend / volatility / momentum) are computed from the full window.
+n_years = st.sidebar.number_input(
+    "Years of history", min_value=1, max_value=20, value=5, step=1,
+    help="Enter X1-X18 for each year. More years = stronger trend/volatility signals.",
+)
+n_years = int(n_years)
 
-# Previous year inputs (optional, for YoY trend features — 5 key indicators only)
-st.sidebar.markdown("---")
-YOY_LABELS_SIDEBAR = {
-    "X4": "EBITDA", "X6": "Net Income", "X10": "Total Assets",
-    "X16": "Total Revenue", "X17": "Total Liabilities",
-}
-with st.sidebar.expander("📈 Previous Year Data (Optional)"):
-    st.caption("Provide last year's key indicators for trend analysis. Leave as 0 if unavailable.")
-    prev_data = {}
-    for feat in YOY_RAW:
-        label = YOY_LABELS_SIDEBAR.get(feat, feat)
-        prev_data[feat] = st.number_input(
-            f"{label} ({feat}) - Prev Year",
-            value=0.0,
-            format="%.2f",
-            key=f"prev_{feat}",
-        )
+year_labels = [f"Year -{n}" if n > 0 else "Year 0 (latest)" for n in range(n_years - 1, -1, -1)]
+default_years_df = pd.DataFrame(0.0, index=year_labels, columns=RAW_FEATURES)
+
+st.sidebar.caption("Rows = fiscal years (top = oldest, bottom = latest). Columns X1-X18 are raw financials.")
+with st.sidebar.expander("ℹ️ X1-X18 meaning"):
+    st.caption("\n".join(f"- **{f}**: {feature_labels.get(f, f)}" for f in RAW_FEATURES))
+
+years_input = st.sidebar.data_editor(
+    default_years_df,
+    use_container_width=True,
+    num_rows="fixed",
+    key="years_editor",
+)
 
 # --- Main area ---
 predict_btn = st.sidebar.button(t["predict_btn"], use_container_width=True)
 
 if predict_btn:
-    input_df = pd.DataFrame([input_data])
-
-    # Compute financial ratios from raw inputs
-    input_df = compute_ratios(input_df)
-
-    # Compute YoY change rate features (5 key indicators only)
-    has_prev = any(v != 0.0 for v in prev_data.values())
-    if has_prev:
-        prev_df = pd.DataFrame([prev_data])
-        input_df = compute_yoy(input_df, prev_df)
-    else:
-        # No previous year data — fill YoY features with 0
-        for feat in YOY_RAW:
-            input_df[f"YoY_{feat}"] = 0.0
+    # Build the full feature vector (level + panel) from the multi-year input
+    input_df = build_inference_features(years_input)
 
     input_df = input_df.reindex(columns=features, fill_value=0)
     # Standardize raw features (X1-X18) using training scaler
@@ -829,6 +818,9 @@ if predict_btn:
                     total_CFs=3,
                     desired_class="opposite",
                     random_seed=42,
+                    # Only suggest changes to actionable current-year financials,
+                    # not panel-derived features (trend/volatility/years of history).
+                    features_to_vary=RAW_FEATURES,
                 )
 
                 cf_df = cf_result.cf_examples_list[0].final_cfs_df
